@@ -34,11 +34,11 @@ The shader performs one SHA-1 block. This covers Duino-Coin's 40-character previ
 
 ## Performance
 
-The batch size starts at a conservative 16,776,960 candidates with **Auto** enabled. After three full batches at one size, Auto uses their median time to step up or down through the available sizes. It aims for 55 to 95 ms per batch, up to 536,862,720 candidates, and ignores shorter batches capped by the end of a pool job. Intermediate 100,661,760 and 201,323,520 candidate sizes give Auto finer steps around its target. Selecting a batch size manually turns Auto off; the checkbox turns it back on. **Batch time** appears under Connection details. Larger batches reduce submission and readback overhead but may compute more candidates after a match. Select a smaller size if Stop feels delayed or the browser becomes less responsive.
+With **Auto** enabled, the first start spends about 2 seconds timing 64, 128 and 256 threads per workgroup on this GPU and picks a starting batch size from the measured speed; the browser saves both for later visits. After three full batches at one size, Auto uses their median time to step up or down through the available sizes. It aims for 55 to 95 ms per batch, up to 17,179,607,040 candidates, and ignores shorter batches capped by the end of a pool job. Intermediate 100,661,760 and 201,323,520 candidate sizes give Auto finer steps around its target. Selecting a batch size manually turns Auto off; the checkbox turns it back on. **Batch time** appears under Connection details. Larger batches reduce submission and readback overhead but may compute more candidates after a match. Select a smaller size if Stop feels delayed or the browser becomes less responsive.
 
 The SHA-1 shader is generated for each nonce length in [sha1-shader.js](sha1-shader.js) and keeps the whole message in registers. Work shared by many nonces is computed once, either on the CPU for each group of 10,000,000 nonces or once per GPU thread. Two batches stay queued, so the GPU does not wait while the browser reads a result.
 
-The miner uses 256 threads per workgroup on NVIDIA adapters that support it and 128 elsewhere. On one RTX 3060 Laptop GPU, a local no-pool benchmark measured about 7.5 to 7.6 GH/s with 536,862,720 candidates per batch. Batches of 1 to 2 billion candidates did not improve sustained speed and took about 130 to 267 ms each, so they are not offered in the miner. These are local compute measurements, not pool-confirmed mining results.
+On one RTX 3060 Laptop GPU, a local no-pool benchmark measured about 7.6 to 7.7 GH/s with 536,862,720 candidates per batch. Batches above 1 billion candidates did not improve its sustained speed; the larger sizes are meant for faster GPUs. These are local compute measurements, not pool-confirmed mining results.
 
 The displayed hashrate measures candidate hashes computed during the current job. It includes all GPU invocations in a batch, even when a matching nonce is found before the end of that batch. The Hashes tried counter uses K, M, B, T, and Q suffixes; hover it to see the full count. Pool replies, job difficulty, and network time determine how often shares are accepted, so a synthetic GPU benchmark is not a promise of matching payout speed.
 
@@ -50,11 +50,9 @@ Approximate hashrates observed in the live miner. Browser, drivers, power limits
 
 | GPU | Observed hashrate |
 | --- | ---: |
-| RTX 3060 (mobile) | ~3.3 GH/s* |
-| Radeon 680M (mobile) | ~1.3 GH/s* |
+| RTX 3060 (mobile) | ~7.7 GH/s |
+| Radeon 680M (mobile) | ~2.5 GH/s |
 | Intel UHD 620 (mobile) | ~150 MH/s |
-
-\* Measured with an earlier, slower version of the shader.
 
 Tested another GPU? [Open a pull request](https://github.com/ajdasz/duco-gpu-lab/pulls) with the GPU model, browser, batch size, and observed hashrate.
 

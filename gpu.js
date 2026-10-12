@@ -1,12 +1,56 @@
-import { ROW_NONCES, ROW_WORDS, buildShader, packRow } from "./sha1-shader.js";
+import { ROW_NONCES, ROW_WORDS, SHADER_VERSION, buildShader, packRow } from "./sha1-shader.js";
 
-const BATCH_SIZE = 8388480 * 64;
+// Every row reports its own match, so the batch size is limited only by the row buffer.
+// The largest batch leaves room for GPUs many times faster than an RTX 3060 Laptop GPU.
+const BATCH_SIZE = 8388480 * 2048;
 // Rows of 10,000,000 nonces, plus the shorter rows below 10,000,000 split by digit count.
 const MAX_ROWS = Math.ceil(BATCH_SIZE / ROW_NONCES) + 9;
-const RESULT_WORDS = 6;
+// Windows resets a GPU that runs one submission for about 2 seconds, so a batch is
+// submitted as separate dispatches of at most 32 rows (320,000,000 nonces).
+const MAX_DISPATCH_ROWS = 32;
+const SAMPLE_WORDS = 5;
+const NOT_FOUND = 0xffffffff;
+// Readback layout: two pass timestamps, the sample digest, then one match offset per row.
+const TIMESTAMP_BYTES = 16;
 // 40 prefix bytes plus 15 decimal nonce digits still fit in one SHA-1 block.
 const MAX_NONCE = 999999999999999;
 const DEFAULT_WORKGROUP_SIZE = 128;
+const WORKGROUP_SIZES = [64, 128, 256];
+// Calibration warms the GPU up, then times rounds of one batch of about 40 ms per
+// workgroup size. Another size must be at least 3% faster to replace 128.
+const CALIBRATION = { warmUpMs: 400, batchMs: 40, rounds: 8, deadlineMs: 4000, minGain: 1.03 };
+const CALIBRATION_JOB = ["7a8220fede52c1ccc2ee703cd1b51d36ec7e1ef8", "0".repeat(40)];
+// Calibration batches start at the first 10-digit nonce and stay within 10 digits.
+const CALIBRATION_START = 1000000000;
+const CALIBRATION_MAX_COUNT = 9000000000;
+
+function settingsKey(info) {
+  const id = ["vendor", "architecture", "description"].map(field => info?.[field]?.trim() || "").join("|");
+  return `duco-gpu-lab.gpu.v${SHADER_VERSION}.${id}`;
+}
+
+// Calibration and batch size saved for this GPU, browser and shader version,
+// or null when browser storage is unavailable.
+export function loadGpuSettings(info) {
+  let text;
+  try { text = localStorage.getItem(settingsKey(info)); } catch { return null; }
+  try {
+    const saved = JSON.parse(text);
+    return saved && typeof saved === "object" ? saved : {};
+  } catch { return {}; }
+}
+
+export function saveGpuSettings(info, values) {
+  try {
+    localStorage.setItem(settingsKey(info), JSON.stringify({ ...loadGpuSettings(info), ...values }));
+  } catch { /* Without storage the GPU is calibrated again next time. */ }
+}
+
+function median(values) {
+  const sorted = [...values].sort((a, b) => a - b);
+  const middle = sorted.length >> 1;
+  return sorted.length % 2 ? sorted[middle] : (sorted[middle - 1] + sorted[middle]) / 2;
+}
 
 // Splits [start, start + count) into rows that share the nonce length and every digit
 // except the last seven. The shader loops over the last digit; the other six come
@@ -59,13 +103,21 @@ export class GpuHasher {
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_DST,
     });
     this.output = device.createBuffer({
-      size: RESULT_WORDS * 4,
+      size: (SAMPLE_WORDS + MAX_ROWS) * 4,
       usage: GPUBufferUsage.STORAGE | GPUBufferUsage.COPY_SRC | GPUBufferUsage.COPY_DST,
     });
+    // GPU timestamps make calibration steadier when the browser exposes them.
+    if (device.features.has("timestamp-query")) {
+      this.querySet = device.createQuerySet({ type: "timestamp", count: 4 });
+      this.queryResolve = device.createBuffer({
+        size: 512,
+        usage: GPUBufferUsage.QUERY_RESOLVE | GPUBufferUsage.COPY_SRC,
+      });
+    }
     // Two readback buffers let the next batch run while the previous result is mapped.
     this.readbacks = [0, 1].map(() => ({
       buffer: device.createBuffer({
-        size: RESULT_WORDS * 4,
+        size: TIMESTAMP_BYTES + (SAMPLE_WORDS + MAX_ROWS) * 4,
         usage: GPUBufferUsage.COPY_DST | GPUBufferUsage.MAP_READ,
       }),
       done: Promise.resolve(),
@@ -80,31 +132,111 @@ export class GpuHasher {
       ],
     });
     this.cachedJob = "";
-    this.reset = new Uint32Array([0xffffffff, 0, 0, 0, 0, 0]);
+    this.reset = new Uint32Array(SAMPLE_WORDS + MAX_ROWS).fill(NOT_FOUND, SAMPLE_WORDS);
   }
 
-  static async create(selectedAdapter = null, options = {}) {
+  // Pass `workgroupSize` to skip calibration; `onCalibrate` is called before a calibration starts.
+  static async create(selectedAdapter = null, { workgroupSize, onCalibrate } = {}) {
     if (!navigator.gpu) {
       throw new Error("WebGPU is unavailable. Open this page in a recent Chrome or Chromium on localhost.");
     }
     const adapter = selectedAdapter || await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) throw new Error("No WebGPU adapter was found. Check browser GPU settings and drivers.");
-    const device = await adapter.requestDevice();
-    const vendor = (device.adapterInfo?.vendor || adapter.info?.vendor || "").toLowerCase();
-    const supports256 = device.limits.maxComputeWorkgroupSizeX >= 256 &&
-      device.limits.maxComputeInvocationsPerWorkgroup >= 256;
-    const workgroupSize = options.workgroupSize ?? (vendor === "nvidia" && supports256 ? 256 : DEFAULT_WORKGROUP_SIZE);
-    const hasher = new GpuHasher(device, { ...options, workgroupSize });
-    hasher.adapterInfo = device.adapterInfo || adapter.info || null;
-    // Compile every nonce length up front; the pool range always starts at nonce 0.
-    await Promise.all(Array.from({ length: 15 }, (_, i) => hasher.pipeline(i + 1)));
-    await hasher.selfTest();
+    const info = adapter.info || null;
+    // Without storage the calibration could not be kept, so the default size is used.
+    const saved = loadGpuSettings(info);
+    const needsCalibration = !workgroupSize && saved !== null && !saved.workgroupSize;
+    const timing = needsCalibration && adapter.features.has("timestamp-query");
+    const device = await adapter.requestDevice(timing ? { requiredFeatures: ["timestamp-query"] } : undefined);
+    const sizes = WORKGROUP_SIZES.filter(size => size <= device.limits.maxComputeInvocationsPerWorkgroup &&
+      size <= device.limits.maxComputeWorkgroupSizeX);
+    const savedSize = workgroupSize ? undefined : sizes.find(size => size === saved?.workgroupSize);
+    const hasher = new GpuHasher(device, { workgroupSize: workgroupSize ?? savedSize ?? DEFAULT_WORKGROUP_SIZE });
+    hasher.adapterInfo = info;
+    hasher.calibration = {
+      source: workgroupSize ? "manual" : savedSize ? "saved" : "default",
+      rate: savedSize && Number.isFinite(saved.rate) ? saved.rate : null,
+    };
+    await hasher.prepare();
+    if (needsCalibration && sizes.length > 1) {
+      onCalibrate?.();
+      const fallback = hasher.workgroupSize;
+      try {
+        const { workgroupSize: best, rate } = await hasher.calibrate(sizes);
+        if (best !== fallback) {
+          hasher.workgroupSize = best;
+          await hasher.prepare();
+        }
+        hasher.calibration = { source: "calibrated", rate };
+        saveGpuSettings(info, { workgroupSize: best, rate });
+      } catch {
+        // Keep the default size, which already passed the self-tests.
+        hasher.workgroupSize = fallback;
+      }
+      for (const key of hasher.pipelines.keys()) {
+        if (!key.startsWith(`${hasher.workgroupSize}:`)) hasher.pipelines.delete(key);
+      }
+    }
     return hasher;
   }
 
-  pipeline(digits) {
-    if (!this.pipelines.has(digits)) {
-      const { code, plan } = buildShader(digits, { workgroupSize: this.workgroupSize });
+  // Compiles every nonce length for the current workgroup size and runs the self-tests.
+  // The pool range always starts at nonce 0.
+  async prepare() {
+    await Promise.all(Array.from({ length: 15 }, (_, i) => this.pipeline(i + 1)));
+    await this.selfTest();
+  }
+
+  // Times batches of 10-digit nonces with two queued, as in mining, so the GPU never
+  // idles. Each batch's time comes from GPU timestamps or, without them, from the gap
+  // between its result and the previous one. After a warm-up that sizes the batches,
+  // every round runs one batch per workgroup size.
+  // Returns the size with the best median rate, in hashes per second.
+  async calibrate(sizes) {
+    await Promise.all(sizes.map(size => this.pipeline(10, size)));
+    const started = performance.now();
+    const warmUpEnd = started + CALIBRATION.warmUpMs;
+    const order = Array.from({ length: CALIBRATION.rounds }, () => sizes).flat();
+    const samples = new Map(sizes.map(size => [size, []]));
+    const queue = [];
+    let count = 1 << 20;
+    let measuring = false;
+    const submit = () => {
+      const size = measuring ? order.shift() : this.workgroupSize;
+      const result = this.hashBatch(...CALIBRATION_JOB, CALIBRATION_START, count, { workgroupSize: size, timed: true });
+      queue.push({ size, count, measured: measuring, result });
+    };
+    submit();
+    submit();
+    let last = null;
+    while (queue.length) {
+      const batch = queue.shift();
+      const { gpuMs } = await batch.result;
+      const now = performance.now();
+      if (now - started > CALIBRATION.deadlineMs) throw new Error("GPU calibration took too long.");
+      if (last !== null) {
+        const ms = gpuMs ?? now - last;
+        if (batch.measured) {
+          samples.get(batch.size).push(batch.count / ms);
+        } else if (!measuring) {
+          count = Math.min(Math.max(Math.round(batch.count / ms * CALIBRATION.batchMs), 1 << 16), CALIBRATION_MAX_COUNT);
+          measuring = now >= warmUpEnd && Math.abs(ms - CALIBRATION.batchMs) < CALIBRATION.batchMs / 4;
+        }
+      }
+      last = now;
+      if (!measuring || order.length) submit();
+    }
+    const rates = new Map([...samples].map(([size, values]) => [size, median(values)]));
+    let best = this.workgroupSize;
+    for (const [size, rate] of rates) if (rate > rates.get(best)) best = size;
+    if (rates.get(best) < rates.get(this.workgroupSize) * CALIBRATION.minGain) best = this.workgroupSize;
+    return { workgroupSize: best, rate: Math.round(rates.get(best) * 1000), rates };
+  }
+
+  pipeline(digits, workgroupSize = this.workgroupSize) {
+    const key = `${workgroupSize}:${digits}`;
+    if (!this.pipelines.has(key)) {
+      const { code, plan } = buildShader(digits, { workgroupSize });
       const promise = (async () => {
         const module = this.device.createShaderModule({ code });
         const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === "error");
@@ -115,10 +247,10 @@ export class GpuHasher {
         });
         return { pipeline, plan };
       })();
-      promise.catch(() => this.pipelines.delete(digits));
-      this.pipelines.set(digits, promise);
+      promise.catch(() => this.pipelines.delete(key));
+      this.pipelines.set(key, promise);
     }
-    return this.pipelines.get(digits);
+    return this.pipelines.get(key);
   }
 
   async selfTest() {
@@ -196,29 +328,31 @@ export class GpuHasher {
 
   // Submits one batch and resolves with its result. Calls may overlap: batches are
   // submitted in call order, so the caller can queue the next batch before awaiting.
-  hashBatch(prefix, target, start, count) {
+  // `timed` adds the GPU time of the batch as `gpuMs` when timestamps are available.
+  hashBatch(prefix, target, start, count, { workgroupSize = this.workgroupSize, timed = false } = {}) {
     if (!Number.isSafeInteger(start) || start < 0 || start > MAX_NONCE ||
         !Number.isInteger(count) || count < 1 || count > BATCH_SIZE || start + count - 1 > MAX_NONCE) {
       return Promise.reject(new Error("Invalid GPU nonce range."));
     }
-    const submitted = this.queueTail.then(() => this.submitBatch(prefix, target, start, count));
+    const submitted = this.queueTail.then(() => this.submitBatch(prefix, target, start, count, workgroupSize, timed));
     this.queueTail = submitted.then(() => {}, () => {});
     return submitted.then(pending => pending.result);
   }
 
-  async submitBatch(prefix, target, start, count) {
-    const readback = this.readbacks[this.nextReadback];
+  async submitBatch(prefix, target, start, count, workgroupSize, timed) {
+    const slot = this.nextReadback;
+    const readback = this.readbacks[slot];
     this.nextReadback = (this.nextReadback + 1) % this.readbacks.length;
     await readback.done;
     this.writeJob(prefix, target);
     const rows = splitRows(start, count);
     const dispatches = [];
     for (const [index, row] of rows.entries()) {
-      const { pipeline, plan } = await this.pipeline(row.digits);
-      packRow(this.rowData, index * ROW_WORDS, plan, this.rowWords(row.digits, row.high), this.targetWords, row);
+      const { pipeline, plan } = await this.pipeline(row.digits, workgroupSize);
+      packRow(this.rowData, index * ROW_WORDS, plan, this.rowWords(row.digits, row.high), this.targetWords, { ...row, row: index });
       const invocations = row.vLast - row.vFirst + 1;
       const last = dispatches.at(-1);
-      if (last && last.pipeline === pipeline) {
+      if (last && last.pipeline === pipeline && last.rows < MAX_DISPATCH_ROWS) {
         last.rows++;
         last.invocations = Math.max(last.invocations, invocations);
       } else {
@@ -226,25 +360,48 @@ export class GpuHasher {
       }
     }
     this.device.queue.writeBuffer(this.input, 0, this.rowData, 0, rows.length * ROW_WORDS);
-    this.device.queue.writeBuffer(this.output, 0, this.reset);
-    const encoder = this.device.createCommandEncoder();
-    const pass = encoder.beginComputePass();
-    for (const dispatch of dispatches) {
+    const resultWords = SAMPLE_WORDS + rows.length;
+    this.device.queue.writeBuffer(this.output, 0, this.reset, 0, resultWords);
+    const stamps = timed && this.querySet ? slot * 2 : null;
+    for (const [index, dispatch] of dispatches.entries()) {
+      const first = index === 0;
+      const last = index === dispatches.length - 1;
+      const encoder = this.device.createCommandEncoder();
+      // The timestamps span the whole batch: the first pass starts it, the last ends it.
+      const pass = encoder.beginComputePass(stamps === null ? undefined : {
+        timestampWrites: {
+          querySet: this.querySet,
+          ...(first && { beginningOfPassWriteIndex: stamps }),
+          ...(last && { endOfPassWriteIndex: stamps + 1 }),
+        },
+      });
       pass.setPipeline(dispatch.pipeline);
       pass.setBindGroup(0, this.bindGroup, [dispatch.first * ROW_WORDS * 4]);
-      pass.dispatchWorkgroups(Math.ceil(dispatch.invocations / this.workgroupSize), dispatch.rows);
+      pass.dispatchWorkgroups(Math.ceil(dispatch.invocations / workgroupSize), dispatch.rows);
+      pass.end();
+      if (last) {
+        encoder.copyBufferToBuffer(this.output, 0, readback.buffer, TIMESTAMP_BYTES, resultWords * 4);
+        if (stamps !== null) {
+          encoder.resolveQuerySet(this.querySet, stamps, 2, this.queryResolve, slot * 256);
+          encoder.copyBufferToBuffer(this.queryResolve, slot * 256, readback.buffer, 0, 16);
+        }
+      }
+      this.device.queue.submit([encoder.finish()]);
     }
-    pass.end();
-    encoder.copyBufferToBuffer(this.output, 0, readback.buffer, 0, RESULT_WORDS * 4);
-    this.device.queue.submit([encoder.finish()]);
-    const result = readback.buffer.mapAsync(GPUMapMode.READ).then(() => {
-      const words = new Uint32Array(readback.buffer.getMappedRange()).slice();
+    const mappedBytes = TIMESTAMP_BYTES + resultWords * 4;
+    const result = readback.buffer.mapAsync(GPUMapMode.READ, 0, mappedBytes).then(() => {
+      const mapped = readback.buffer.getMappedRange(0, mappedBytes);
+      const [begin, end] = new BigUint64Array(mapped, 0, 2);
+      const words = new Uint32Array(mapped, TIMESTAMP_BYTES, resultWords).slice();
       readback.buffer.unmap();
+      // Rows are in nonce order, so the first row with a match holds the lowest nonce.
+      const hit = rows.findIndex((_, index) => words[SAMPLE_WORDS + index] !== NOT_FOUND);
       return {
-        found: words[0] === 0xffffffff ? null : start + words[0],
-        sample: [...words.slice(1)].map(word => word.toString(16).padStart(8, "0")).join(""),
+        found: hit < 0 ? null : start + rows[hit].offset + words[SAMPLE_WORDS + hit],
+        sample: [...words.slice(0, SAMPLE_WORDS)].map(word => word.toString(16).padStart(8, "0")).join(""),
         count,
         start,
+        gpuMs: stamps !== null && end > begin ? Number(end - begin) / 1e6 : null,
       };
     });
     readback.done = result.then(() => {}, () => {});

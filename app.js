@@ -1,7 +1,7 @@
-import { GpuHasher } from "./gpu.js";
+import { GpuHasher, loadGpuSettings, saveGpuSettings } from "./gpu.js";
 import { BatchTuner } from "./batch-tuner.js";
 
-const ids = ["gpuSupport", "gpuName", "startButton", "stopButton", "statusDot", "statusText", "hashrate", "rateUnit", "totalHashes", "goodShares", "badShares", "rateChart", "chartEmpty", "peakRate", "formulaInput", "sampleHash", "targetHash", "matchBadge", "difficulty", "currentNonce", "lastMatch", "latency", "batchTime", "username", "miningKey", "rigName", "batchSize", "autoBatch", "batchHint", "poolUrl", "nodeName", "poolVersion", "uptime", "lastShare", "acceptance", "eventLog", "clearLog"];
+const ids = ["gpuSupport", "gpuName", "startButton", "stopButton", "statusDot", "statusText", "hashrate", "rateUnit", "totalHashes", "goodShares", "badShares", "rateChart", "chartEmpty", "peakRate", "formulaInput", "sampleHash", "targetHash", "matchBadge", "difficulty", "currentNonce", "lastMatch", "latency", "batchTime", "workgroupSize", "username", "miningKey", "rigName", "batchSize", "autoBatch", "batchHint", "poolUrl", "nodeName", "poolVersion", "uptime", "lastShare", "acceptance", "eventLog", "clearLog"];
 const el = Object.fromEntries(ids.map(id => [id, document.getElementById(id)]));
 const numberFormat = new Intl.NumberFormat("en-US");
 const credentialKeys = { username: "duco-gpu-lab.username", miningKey: "duco-gpu-lab.miningKey" };
@@ -130,6 +130,23 @@ function saveCredentials() {
   try {
     for (const [field, key] of Object.entries(credentialKeys)) localStorage.setItem(key, el[field].value);
   } catch { /* Mining can still run when browser storage is unavailable. */ }
+}
+
+// Auto starts from the batch size saved for this GPU, or from the calibrated rate.
+function restoreBatchSize(hasher) {
+  if (!el.autoBatch.checked) return;
+  const { sizes, targetMs } = batchTuner;
+  const saved = loadGpuSettings(hasher.adapterInfo)?.batchSize;
+  const rate = hasher.calibration.rate;
+  const size = sizes.includes(saved) ? saved : rate
+    ? sizes.reduce((best, size) => Math.abs(size / rate * 1000 - targetMs) < Math.abs(best / rate * 1000 - targetMs) ? size : best)
+    : null;
+  if (size) el.batchSize.value = String(size);
+}
+
+function workgroupLabel(hasher) {
+  const source = { calibrated: "calibrated", saved: "saved calibration" }[hasher.calibration.source] || "default";
+  return `${hasher.workgroupSize} (${source})`;
 }
 
 function updateBatchHint() {
@@ -266,7 +283,11 @@ async function mineJob(job, session) {
     lastFinished = finished;
     el.batchTime.textContent = `${Math.round(batchMs)} ms`;
     if (el.autoBatch.checked && Number(el.batchSize.value) === batch.selectedBatchSize && batch.count === batch.selectedBatchSize) {
-      el.batchSize.value = String(batchTuner.observe(batch.selectedBatchSize, batchMs));
+      const nextSize = batchTuner.observe(batch.selectedBatchSize, batchMs);
+      if (nextSize !== batch.selectedBatchSize) {
+        el.batchSize.value = String(nextSize);
+        saveGpuSettings(state.hasher.adapterInfo, { batchSize: nextSize });
+      }
     }
     attempted += result.count;
     state.totalHashes += result.count;
@@ -405,12 +426,19 @@ async function start() {
   setStatus("Initializing WebGPU", "working");
   log("Requesting high-performance WebGPU adapter and running SHA-1 self-test.");
   try {
-    if (!state.hasher) state.hasher = await GpuHasher.create(await getMiningAdapter());
+    if (!state.hasher) {
+      state.hasher = await GpuHasher.create(await getMiningAdapter(), {
+        onCalibrate: () => setStatus("Calibrating GPU, about 2 s", "working"),
+      });
+    }
     if (!state.running || session !== state.session) return;
     showGpuName(state.hasher.adapterInfo);
     el.gpuSupport.textContent = "GPU VERIFIED";
     el.gpuSupport.classList.add("supported");
     log("GPU SHA-1 self-tests passed, including a real pool job.", "good");
+    el.workgroupSize.textContent = workgroupLabel(state.hasher);
+    log(`Workgroup size ${el.workgroupSize.textContent}.`);
+    restoreBatchSize(state.hasher);
     state.hasher.device.lost.then(info => {
       state.hasher = null;
       adapterPromise = null;
