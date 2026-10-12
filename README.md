@@ -40,6 +40,8 @@ The shader packs the fixed 40-character prefix once per job. The CPU precomputes
 
 The displayed hashrate measures candidate hashes computed during the current job. It includes all GPU invocations in a batch, even when a matching nonce is found before the end of that batch. The Hashes tried counter uses K, M, B, T, and Q suffixes; hover it to see the full count. Pool replies, job difficulty, and network time determine how often shares are accepted, so a synthetic GPU benchmark is not a promise of matching payout speed.
 
+The header identifies the WebGPU adapter as precisely as the browser allows. Browsers may hide the exact model, so the page also checks the local WebGL renderer and shows its model when the vendor matches. On systems with multiple GPUs from the same vendor, WebGL may identify a different card; the tooltip says when WebGL supplied the model. If neither API provides a model, the header shows the available vendor and architecture. The GPU name stays in the browser and is not submitted to the pool.
+
 ## Tested GPUs
 
 Approximate hashrates observed in the live miner. Browser, drivers, power limits, and batch size can change the result.

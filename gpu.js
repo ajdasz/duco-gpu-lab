@@ -54,11 +54,11 @@ export class GpuHasher {
     this.reset = new Uint32Array([0xffffffff, 0, 0, 0, 0, 0]);
   }
 
-  static async create() {
+  static async create(selectedAdapter = null) {
     if (!navigator.gpu) {
       throw new Error("WebGPU is unavailable. Open this page in a recent Chrome or Chromium on localhost.");
     }
-    const adapter = await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
+    const adapter = selectedAdapter || await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) throw new Error("No WebGPU adapter was found. Check browser GPU settings and drivers.");
     const device = await adapter.requestDevice();
     const response = await fetch("./gpu-sha1.wgsl", { cache: "no-store" });
@@ -68,6 +68,7 @@ export class GpuHasher {
     if (errors.length) throw new Error(`GPU shader error: ${errors[0].message}`);
     const pipeline = device.createComputePipeline({ layout: "auto", compute: { module, entryPoint: "main" } });
     const hasher = new GpuHasher(device, pipeline);
+    hasher.adapterInfo = device.adapterInfo || adapter.info || null;
     await hasher.selfTest();
     return hasher;
   }

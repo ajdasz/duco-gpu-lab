@@ -1,17 +1,81 @@
 import { GpuHasher } from "./gpu.js";
 import { BatchTuner } from "./batch-tuner.js";
 
-const ids = ["gpuSupport", "startButton", "stopButton", "statusDot", "statusText", "hashrate", "rateUnit", "totalHashes", "goodShares", "badShares", "rateChart", "chartEmpty", "peakRate", "formulaInput", "sampleHash", "targetHash", "matchBadge", "difficulty", "currentNonce", "lastMatch", "latency", "batchTime", "username", "miningKey", "rigName", "batchSize", "autoBatch", "batchHint", "poolUrl", "nodeName", "poolVersion", "uptime", "lastShare", "acceptance", "eventLog", "clearLog"];
+const ids = ["gpuSupport", "gpuName", "startButton", "stopButton", "statusDot", "statusText", "hashrate", "rateUnit", "totalHashes", "goodShares", "badShares", "rateChart", "chartEmpty", "peakRate", "formulaInput", "sampleHash", "targetHash", "matchBadge", "difficulty", "currentNonce", "lastMatch", "latency", "batchTime", "username", "miningKey", "rigName", "batchSize", "autoBatch", "batchHint", "poolUrl", "nodeName", "poolVersion", "uptime", "lastShare", "acceptance", "eventLog", "clearLog"];
 const el = Object.fromEntries(ids.map(id => [id, document.getElementById(id)]));
 const numberFormat = new Intl.NumberFormat("en-US");
 const credentialKeys = { username: "duco-gpu-lab.username", miningKey: "duco-gpu-lab.miningKey" };
 const batchTuner = new BatchTuner([...el.batchSize.options].map(option => Number(option.value)));
+let adapterPromise = null;
+let webglModelCache = null;
 const state = {
   running: false, session: 0, hasher: null, requests: new Set(),
   startedAt: 0, lastShareAt: 0,
   totalHashes: 0, good: 0, bad: 0, rate: 0, peak: 0,
   rateSamples: Array(60).fill(0), latestJob: null,
 };
+
+function getMiningAdapter() {
+  if (!navigator.gpu) return Promise.resolve(null);
+  if (!adapterPromise) {
+    adapterPromise = navigator.gpu.requestAdapter({ powerPreference: "high-performance" })
+      .catch(error => { adapterPromise = null; throw error; });
+  }
+  return adapterPromise;
+}
+
+function webglGpuModel(info) {
+  const vendor = info?.vendor?.trim().toLowerCase();
+  if (!vendor) return "";
+  if (webglModelCache?.vendor === vendor) return webglModelCache.name;
+
+  let name = "";
+  try {
+    const gl = document.createElement("canvas").getContext("webgl2", { powerPreference: "high-performance" });
+    const extension = gl?.getExtension("WEBGL_debug_renderer_info");
+    const renderer = extension ? String(gl.getParameter(extension.UNMASKED_RENDERER_WEBGL) || "") : "";
+    const aliases = vendor === "amd" ? ["amd", "ati"] : [vendor];
+    if (aliases.some(alias => renderer.toLowerCase().includes(alias))) {
+      const angleModel = renderer.match(/^ANGLE \([^,]+,\s*([^,]+)(?:,|\))/i);
+      name = (angleModel?.[1] || renderer)
+        .replace(/\s*\(0x[\da-f]+\).*$/i, "")
+        .replace(/\s+(?:Direct3D\d*|D3D\d*|Vulkan|OpenGL).*$/i, "")
+        .trim();
+    }
+    gl?.getExtension("WEBGL_lose_context")?.loseContext();
+  } catch { /* Browser may restrict renderer details. */ }
+  webglModelCache = { vendor, name };
+  return name;
+}
+
+function showGpuName(info) {
+  const description = info?.description?.trim();
+  const device = info?.device?.trim();
+  const vendor = info?.vendor?.trim();
+  const architecture = info?.architecture?.trim();
+  const webgpuModel = description || (device && !/^0x[\da-f]+$/i.test(device) ? device : "");
+  const webglModel = webgpuModel ? "" : webglGpuModel(info);
+  const name = webgpuModel || webglModel || [vendor, architecture].filter(Boolean).join(" ") || "GPU model unavailable";
+  el.gpuName.textContent = name;
+  el.gpuName.title = webglModel ? `${name} (reported by WebGL; WebGPU: ${[vendor, architecture].filter(Boolean).join(" ")})` : name;
+}
+
+async function detectGpu() {
+  if (!navigator.gpu) { showGpuName(null); return; }
+  try {
+    const adapter = await getMiningAdapter();
+    if (state.hasher) return;
+    if (!adapter) {
+      showGpuName(null);
+      el.gpuSupport.textContent = "NO GPU ADAPTER";
+      el.gpuSupport.classList.remove("supported");
+      return;
+    }
+    showGpuName(adapter.info);
+  } catch {
+    if (!state.hasher) showGpuName(null);
+  }
+}
 
 function setStatus(text, kind = "idle") {
   el.statusText.textContent = text;
@@ -329,13 +393,16 @@ async function start() {
   setStatus("Initializing WebGPU", "working");
   log("Requesting high-performance WebGPU adapter and running SHA-1 self-test.");
   try {
-    if (!state.hasher) state.hasher = await GpuHasher.create();
+    if (!state.hasher) state.hasher = await GpuHasher.create(await getMiningAdapter());
     if (!state.running || session !== state.session) return;
+    showGpuName(state.hasher.adapterInfo);
     el.gpuSupport.textContent = "GPU VERIFIED";
     el.gpuSupport.classList.add("supported");
     log("GPU SHA-1 self-tests passed, including a real pool job.", "good");
     state.hasher.device.lost.then(info => {
       state.hasher = null;
+      adapterPromise = null;
+      webglModelCache = null;
       if (state.running) fail(new Error(`GPU device lost: ${info.message || "unknown reason"}`));
     });
     log(`Connecting to ${el.nodeName.textContent} with the Mini Miner HTTP protocol.`);
@@ -368,6 +435,7 @@ restoreCredentials();
 updateBatchHint();
 el.gpuSupport.textContent = navigator.gpu ? "WEBGPU AVAILABLE" : "WEBGPU UNAVAILABLE";
 el.gpuSupport.classList.toggle("supported", Boolean(navigator.gpu));
+detectGpu();
 renderMetrics();
 drawChart();
 setInterval(tick, 1000);
