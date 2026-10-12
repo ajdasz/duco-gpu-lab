@@ -1,5 +1,7 @@
 # DUCO GPU Lab
 
+**[Open the live WebGPU miner](https://ajdasz.github.io/duco-gpu-lab/)**
+
 An experimental, buildless Duino-Coin miner made out of curiosity. SHA-1 nonce candidates run in a WebGPU compute shader. The page displays actual GPU batch counts, hashrate, the current input and digest, and pool-confirmed accepted and rejected shares.
 
 > Mining can increase power use and heat. Use DUCO GPU Lab at your own risk. This is an independent experimental project.
@@ -20,9 +22,7 @@ The pool URL is editable under **More settings**. Its default is `https://server
 
 ## GitHub Pages
 
-The source is in [ajdasz/duco-gpu-lab](https://github.com/ajdasz/duco-gpu-lab). The site URL is [ajdasz.github.io/duco-gpu-lab](https://ajdasz.github.io/duco-gpu-lab/) once GitHub Pages is enabled. No build step is needed. The empty `.nojekyll` file tells Pages to serve the static files as they are, including the WebGPU shader.
-
-If Pages is not enabled yet, open **Settings > Pages** in the repository. Under **Build and deployment**, choose **Deploy from a branch**, then select `main` and `/(root)` and save.
+The live site is published from the `main` branch and `/(root)` through GitHub Pages. No build step is needed. The empty `.nojekyll` file tells Pages to serve the static files as they are, including the WebGPU shader.
 
 GitHub Pages serves the project over HTTPS, which WebGPU needs outside localhost. Login and mining key values saved on localhost do not transfer to the Pages site because browser storage belongs to each site address. Each visitor enters and stores their own values in their browser. After publishing, verify that the pool accepts job requests and share submissions from the Pages address; the pool controls its cross-origin access policy.
 
@@ -39,5 +39,16 @@ The batch size starts at a conservative 16,776,960 candidates with **Auto** enab
 The shader packs the fixed 40-character prefix once per job. The CPU precomputes the first ten SHA-1 rounds, which are identical for every nonce in a job. The GPU runs the remaining rounds in separate SHA-1 phases and keeps only 16 schedule words per invocation. The performance chart refreshes once per second and the detailed hash display refreshes at most five times per second. Calculation details are available in the expandable job section.
 
 The displayed hashrate measures candidate hashes computed during the current job. It includes all GPU invocations in a batch, even when a matching nonce is found before the end of that batch. The Hashes tried counter uses K, M, B, T, and Q suffixes; hover it to see the full count. Pool replies, job difficulty, and network time determine how often shares are accepted, so a synthetic GPU benchmark is not a promise of matching payout speed.
+
+## Tested GPUs
+
+Approximate hashrates observed in the live miner. Browser, drivers, power limits, and batch size can change the result.
+
+| GPU | Observed hashrate |
+| --- | ---: |
+| Radeon 680M (mobile) | ~1.3 GH/s |
+| RTX 3060 (mobile) | ~3.3 GH/s |
+
+Tested another GPU? [Open a pull request](https://github.com/ajdasz/duco-gpu-lab/pulls) with the GPU model, browser, batch size, and observed hashrate.
 
 Protocol references: [official Mini Miner](https://server.duinocoin.com/miniminer.html) and [official PC miner](https://github.com/duino-coin/duino-coin/blob/master/PC_Miner.py).
