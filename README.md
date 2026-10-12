@@ -46,13 +46,31 @@ The header identifies the WebGPU adapter as precisely as the browser allows. Bro
 
 ## Tested GPUs
 
-Approximate hashrates observed in the live miner. Browser, drivers, power limits, and batch size can change the result.
+Approximate hashrates observed in the live miner, most of them reported by testers. Browser, drivers, power limits, and batch size can change the result.
 
 | GPU | Observed hashrate |
 | --- | ---: |
+| RTX 4070 Ti | ~30.7 GH/s |
+| RTX 5080 | ~26.2 GH/s* |
+| Radeon RX 7900 XT | ~23.8 GH/s |
+| Radeon RX 9070 XT (Linux) | ~20.4 GH/s |
+| Intel Arc B580 | ~15.2 GH/s |
+| RTX 4060 (mobile) | ~11.7 GH/s |
+| RTX 2070 | ~11 GH/s |
 | RTX 3060 (mobile) | ~9.5 GH/s |
+| GTX 1080 | ~6.9 GH/s* |
+| Apple M1 Max | ~4.3 GH/s |
 | Radeon 680M (mobile) | ~3.0 GH/s |
+| Apple M2 (MacBook Air) | ~2.0 GH/s |
+| Apple M4 | ~2 GH/s |
+| Radeon Vega 10 (Ryzen 7 3750H) | ~1.1 GH/s* |
+| Samsung Galaxy S10+ (phone) | ~320 MH/s* |
+| Intel N150 (integrated) | ~200 MH/s |
 | Intel UHD 620 (mobile) | ~150 MH/s |
+
+\* Reported before the October 2026 shader update. GPUs retested after it ran about 25 to 50% faster.
+
+WebGPU did not detect a GeForce GT 740M or the Intel HD Graphics 400 of an Atom processor.
 
 Tested another GPU? [Open a pull request](https://github.com/ajdasz/duco-gpu-lab/pulls) with the GPU model, browser, batch size, and observed hashrate.
 
