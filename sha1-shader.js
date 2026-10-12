@@ -9,10 +9,12 @@
 // Each message and schedule word is classified as:
 //   ROW    - the same for the whole row: the CPU folds it into constants,
 //   THREAD - fixed per invocation: computed once, before the digit loop,
-//   LOOP   - changes with the last digit: computed inside the loop.
+//   LOOP   - changes with the last digit j. The schedule is linear over XOR, so
+//            W[t](j) = W[t](0) ^ E[t][j], where E is a constant: W[t](0) is computed
+//            once per invocation and the loop only applies E.
 
 // Bump when the generated shader changes, so saved GPU calibrations are measured again.
-export const SHADER_VERSION = 2;
+export const SHADER_VERSION = 3;
 export const ROW_WORDS = 192; // 768 bytes, a multiple of the 256-byte offset alignment.
 export const ROW_NONCES = 10000000;
 export const IV = [0x67452301, 0xefcdab89, 0x98badcfe, 0x10325476, 0xc3d2e1f0];
@@ -63,12 +65,26 @@ export function shaderPlan(digits) {
 
 const hex = value => `0x${(value >>> 0).toString(16)}u`;
 
-export function buildShader(digits, { workgroupSize = 128 } = {}) {
+// Shader variants for the last-digit loop. Both use the same arithmetic; GPUs differ in
+// which one runs faster, so the miner times them on each GPU.
+//   table:    one loop over the digit, E[t][j] read from a constant array,
+//   unrolled: one copy of the loop body per digit, E[t][j] as immediates.
+export const SHADER_VARIANTS = ["table", "unrolled"];
+
+export function buildShader(digits, { workgroupSize = 128, variant = "table" } = {}) {
+  if (!SHADER_VARIANTS.includes(variant)) throw new Error("Unknown shader variant.");
   const plan = shaderPlan(digits);
-  const { cls, start } = plan;
+  const { cls, start, loopWord } = plan;
+  // E[j][t]: what the last digit j adds to word t through the linear message schedule.
+  const shift = 24 - 8 * (plan.lastPosition & 3);
+  const E = Array.from({ length: 10 }, (_, j) => {
+    const delta = new Array(80).fill(0);
+    delta[loopWord] = j << shift;
+    for (let t = 16; t < 80; t++) delta[t] = rotl((delta[t - 3] ^ delta[t - 8] ^ delta[t - 14] ^ delta[t - 16]) >>> 0, 1);
+    return delta;
+  });
+
   const pre = [];
-  const body = [];
-  const tail = [];
   const loaded = new Set();
   const row = index => {
     if (!loaded.has(index)) {
@@ -77,9 +93,6 @@ export function buildShader(digits, { workgroupSize = 128 } = {}) {
     }
     return `r${index}`;
   };
-
-  // Each value tracks where it was computed so loop-invariant work stays before the loop.
-  const where = new Map();
 
   // Thread digits, most significant first.
   const digitNames = [];
@@ -104,92 +117,103 @@ export function buildShader(digits, { workgroupSize = 128 } = {}) {
     smallDigits("v", count, "dl");
   }
 
-  // Message words 10..15 that are not fixed for the row.
-  const words = [];
+  // Message and schedule words that are not fixed for the row, with the last digit at 0.
+  const x = [];
   for (let i = 10; i < 16; i++) {
     if (cls[i] === ROW) continue;
     let expression = row(SLOT.word + i);
     plan.threadPositions.forEach((position, n) => {
       if (position >> 2 === i) expression += ` | (${digitNames[n]} << ${24 - 8 * (position & 3)}u)`;
     });
-    if (cls[i] === THREAD) {
-      pre.push(`let w${i} = ${expression};`);
-    } else {
-      pre.push(`let wb${i} = ${expression};`);
-      body.push(`let w${i} = wb${i} | (j << ${24 - 8 * (plan.lastPosition & 3)}u);`);
-    }
-    words[i] = `w${i}`;
-    where.set(words[i], cls[i]);
+    x[i] = `x${i}`;
+    pre.push(`let ${x[i]} = ${expression};`);
   }
-  const out = (target, name, expression, level) => {
-    target.push(`let ${name} = ${expression};`);
-    where.set(name, level);
-    return name;
-  };
-  const levelOf = name => where.get(name) ?? ROW;
-  const sink = level => level === LOOP ? body : pre;
+  for (let t = 16; t < 80; t++) {
+    if (cls[t] === ROW) continue;
+    const sources = [t - 3, t - 8, t - 14, t - 16];
+    const terms = sources.filter(i => cls[i] !== ROW).map(i => x[i]);
+    const fixed = sources.some(i => cls[i] === ROW) ? [row(SLOT.xor + t)] : [];
+    x[t] = `x${t}`;
+    pre.push(`let ${x[t]} = rol(${[...fixed, ...terms].join(" ^ ")}, 1u);`);
+  }
 
-  const schedule = (t, target) => {
-    const terms = [t - 3, t - 8, t - 14, t - 16].filter(i => cls[i] !== ROW).map(i => words[i]);
-    const fixed = [t - 3, t - 8, t - 14, t - 16].some(i => cls[i] === ROW) ? row(SLOT.xor + t) : null;
-    const invariant = terms.filter(name => levelOf(name) !== LOOP);
-    const varying = terms.filter(name => levelOf(name) === LOOP);
-    let inner = [fixed, ...invariant].filter(Boolean);
-    if (cls[t] === LOOP && varying.length && inner.length > 1) {
-      inner = [out(pre, `q${t}`, inner.join(" ^ "), THREAD)];
+  const fExpression = (t, p, q, r) => {
+    if (t < 20) return `(${r} ^ (${p} & (${q} ^ ${r})))`;
+    if (t < 40 || t >= 60) return `(${p} ^ ${q} ^ ${r})`;
+    return `((${p} & ${q}) | (${r} & (${p} | ${q})))`;
+  };
+  const roundWord = (t, loopWord) => cls[t] === ROW ? row(SLOT.kw + t)
+    : `${hex(roundK(t))} + ${cls[t] === THREAD ? x[t] : loopWord(t)}`;
+
+  // State before round `start` comes from the CPU. Rounds before the first word that
+  // depends on the last digit are computed once per thread, and so is everything in
+  // that first round except its word.
+  let a = row(SLOT.state), b = row(SLOT.state + 1), c = row(SLOT.state + 2), d = row(SLOT.state + 3), e = row(SLOT.state + 4);
+  let first = start;
+  for (; cls[first] !== LOOP; first++) {
+    pre.push(`let a${first + 1} = rol(${a}, 5u) + ${fExpression(first, b, c, d)} + ${e} + ${roundWord(first)};`,
+      `let c${first + 1} = rol(${b}, 30u);`);
+    [a, b, c, d, e] = [`a${first + 1}`, a, `c${first + 1}`, c, d];
+  }
+  pre.push(`let p${first} = rol(${a}, 5u) + ${fExpression(first, b, c, d)} + ${e} + ${hex(roundK(first))};`,
+    `let c${first + 1} = rol(${b}, 30u);`);
+  const loopState = [`a${first + 1}`, a, `c${first + 1}`, c, d];
+
+  // Rounds for one value of the last digit; `loopWord(t)` gives W[t] for that digit.
+  // Rounds 76..79 only run when A76 already matches the target or for the sample.
+  const iteration = (loopWord, indent, guard = null) => {
+    const body = [`let a${first + 1} = p${first} + ${loopWord(first)};`];
+    const tail = [];
+    let [sa, sb, sc, sd, se] = loopState;
+    let a76;
+    for (let t = first + 1; t < 80; t++) {
+      if (t === 76) a76 = sa;
+      (t < 76 ? body : tail).push(`let a${t + 1} = rol(${sa}, 5u) + ${fExpression(t, sb, sc, sd)} + ${se} + ${roundWord(t, loopWord)};`,
+        `let c${t + 1} = rol(${sb}, 30u);`);
+      [sa, sb, sc, sd, se] = [`a${t + 1}`, sa, `c${t + 1}`, sc, sd];
     }
-    const all = [...inner, ...varying].join(" ^ ");
-    const destination = target ?? sink(cls[t]);
-    words[t] = out(destination, `w${t}`, `rol(${all}, 1u)`, target === tail ? LOOP : cls[t]);
+    const digest = [sa, sb, sc, sd, se];
+    return `${body.join(`\n${indent}`)}
+${indent}if (${guard ? `${guard} && (${a76} == expected || index == sampleIndex)` : `${a76} == expected || index == sampleIndex`}) {
+${indent}  ${tail.join(`\n${indent}  `)}
+${indent}  ${digest.map((value, i) => `let h${i} = ${hex(IV[i])} + ${value};`).join(`\n${indent}  `)}
+${indent}  if (index == sampleIndex) {
+${indent}    ${digest.map((_, i) => `result.sample[${i}] = h${i};`).join(`\n${indent}    `)}
+${indent}  }
+${indent}  if (${digest.map((_, i) => `h${i} == rows[rb + ${SLOT.target + i}u]`).join(" && ")}) {
+${indent}    atomicMin(&result.found[row], index);
+${indent}  }
+${indent}}`;
   };
 
-  // State before round `start` comes from the CPU.
-  let a = row(SLOT.state);
-  let b = row(SLOT.state + 1);
-  let c = row(SLOT.state + 2);
-  let d = row(SLOT.state + 3);
-  let e = row(SLOT.state + 4);
-  const fExpression = (t, x, y, z) => {
-    if (t < 20) return `(${z} ^ (${x} & (${y} ^ ${z})))`;
-    if (t < 40 || t >= 60) return `(${x} ^ ${y} ^ ${z})`;
-    return `((${x} & ${y}) | (${z} & (${x} | ${y})))`;
-  };
-  const round = (t, target) => {
-    if (t >= 16 && cls[t] !== ROW && words[t] === undefined) schedule(t, target);
-    const stateLevel = Math.max(levelOf(a), levelOf(b), levelOf(c), levelOf(d), levelOf(e));
-    const wordLevel = cls[t] === ROW ? ROW : levelOf(words[t]);
-    const level = target === tail ? LOOP : Math.max(stateLevel, wordLevel);
-    const destination = target ?? sink(level);
-    const base = `rol(${a}, 5u) + ${fExpression(t, b, c, d)} + ${e}`;
-    let next;
-    if (cls[t] === ROW) {
-      next = out(destination, `a${t + 1}`, `${base} + ${row(SLOT.kw + t)}`, level);
-    } else if (stateLevel !== LOOP && wordLevel === LOOP && target !== tail) {
-      // Everything except the varying word is loop-invariant.
-      const partial = out(pre, `p${t}`, `${base} + ${hex(roundK(t))}`, THREAD);
-      next = out(body, `a${t + 1}`, `${partial} + ${words[t]}`, LOOP);
-    } else {
-      next = out(destination, `a${t + 1}`, `${base} + ${hex(roundK(t))} + ${words[t]}`, level);
-    }
-    const rotated = target === tail
-      ? out(tail, `c${t + 1}`, `rol(${b}, 30u)`, LOOP)
-      : out(sink(levelOf(b)), `c${t + 1}`, `rol(${b}, 30u)`, levelOf(b));
-    e = d;
-    d = c;
-    c = rotated;
-    b = a;
-    a = next;
-  };
-  for (let t = start; t < 76; t++) round(t);
-  const a76 = a;
-  for (let t = 76; t < 80; t++) round(t, tail);
+  let table = "";
+  let loop;
+  if (variant === "unrolled") {
+    loop = E.map((delta, j) => `if (jFirst <= ${j}u && ${j}u <= jLast) {
+    let index = offsetBase + ${j}u;
+    ${iteration(t => delta[t] ? `(${x[t]} ^ ${hex(delta[t])})` : x[t], "    ")}
+  }`).join("\n  ");
+  } else {
+    // Every invocation runs all ten digits so `j`, and the table address, stay uniform.
+    const slots = [];
+    for (let t = 0; t < 80; t++) if (cls[t] === LOOP) slots[t] = slots.filter(slot => slot !== undefined).length;
+    const width = slots.filter(slot => slot !== undefined).length;
+    const values = E.flatMap(delta => delta.filter((_, t) => slots[t] !== undefined).map(hex));
+    table = `const E = array<u32, ${values.length}>(${values.join(", ")});\n`;
+    loop = `for (var j = 0u; j < 10u; j = j + 1u) {
+    let eb = j * ${width}u;
+    let index = offsetBase + j;
+    let inRange = jFirst <= j && j <= jLast;
+    ${iteration(t => `(${x[t]} ^ E[eb + ${slots[t]}u])`, "    ", "inRange")}
+  }`;
+  }
 
-  const code = `// Generated by sha1-shader.js for ${digits}-digit nonces.
+  const code = `// Generated by sha1-shader.js (${variant}) for ${digits}-digit nonces.
 @group(0) @binding(0) var<storage, read> rows: array<u32>;
 // found[row] is the lowest matching offset within that row, or 0xffffffff.
 struct Result { sample: array<u32, 5>, found: array<atomic<u32>> };
 @group(0) @binding(1) var<storage, read_write> result: Result;
-
+${table}
 fn rol(value: u32, bits: u32) -> u32 { return (value << bits) | (value >> (32u - bits)); }
 
 @compute @workgroup_size(${workgroupSize})
@@ -207,30 +231,7 @@ fn main(@builtin(workgroup_id) wid: vec3<u32>, @builtin(local_invocation_index) 
   let sampleIndex = select(0xffffffffu, 0u, row == 0u);
   let expected = rows[rb + ${SLOT.a76}u];
   ${pre.join("\n  ")}
-  for (var j = jFirst; j <= jLast; j = j + 1u) {
-    ${body.join("\n    ")}
-    let index = offsetBase + j;
-    if (${a76} == expected || index == sampleIndex) {
-      ${tail.join("\n      ")}
-      let h0 = ${hex(IV[0])} + ${a};
-      let h1 = ${hex(IV[1])} + ${b};
-      let h2 = ${hex(IV[2])} + ${c};
-      let h3 = ${hex(IV[3])} + ${d};
-      let h4 = ${hex(IV[4])} + ${e};
-      if (index == sampleIndex) {
-        result.sample[0] = h0;
-        result.sample[1] = h1;
-        result.sample[2] = h2;
-        result.sample[3] = h3;
-        result.sample[4] = h4;
-      }
-      if (h0 == rows[rb + ${SLOT.target}u] && h1 == rows[rb + ${SLOT.target + 1}u] &&
-          h2 == rows[rb + ${SLOT.target + 2}u] && h3 == rows[rb + ${SLOT.target + 3}u] &&
-          h4 == rows[rb + ${SLOT.target + 4}u]) {
-        atomicMin(&result.found[row], index);
-      }
-    }
-  }
+  ${loop}
 }
 `;
   return { code, plan };

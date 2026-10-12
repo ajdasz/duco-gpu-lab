@@ -1,7 +1,7 @@
 import { GpuHasher, loadGpuSettings, saveGpuSettings } from "./gpu.js";
 import { BatchTuner } from "./batch-tuner.js";
 
-const ids = ["gpuSupport", "gpuName", "startButton", "stopButton", "statusDot", "statusText", "hashrate", "rateUnit", "totalHashes", "goodShares", "badShares", "rateChart", "chartEmpty", "peakRate", "formulaInput", "sampleHash", "targetHash", "matchBadge", "difficulty", "currentNonce", "lastMatch", "latency", "batchTime", "workgroupSize", "username", "miningKey", "rigName", "batchSize", "autoBatch", "batchHint", "poolUrl", "nodeName", "poolVersion", "uptime", "lastShare", "acceptance", "eventLog", "clearLog"];
+const ids = ["gpuSupport", "gpuName", "startButton", "stopButton", "statusDot", "statusText", "hashrate", "rateUnit", "totalHashes", "goodShares", "badShares", "rateChart", "chartEmpty", "peakRate", "formulaInput", "sampleHash", "targetHash", "matchBadge", "difficulty", "currentNonce", "lastMatch", "latency", "batchTime", "gpuKernel", "username", "miningKey", "rigName", "batchSize", "autoBatch", "batchHint", "poolUrl", "nodeName", "poolVersion", "uptime", "lastShare", "acceptance", "eventLog", "clearLog"];
 const el = Object.fromEntries(ids.map(id => [id, document.getElementById(id)]));
 const numberFormat = new Intl.NumberFormat("en-US");
 const credentialKeys = { username: "duco-gpu-lab.username", miningKey: "duco-gpu-lab.miningKey" };
@@ -144,9 +144,9 @@ function restoreBatchSize(hasher) {
   if (size) el.batchSize.value = String(size);
 }
 
-function workgroupLabel(hasher) {
+function kernelLabel(hasher) {
   const source = { calibrated: "calibrated", saved: "saved calibration" }[hasher.calibration.source] || "default";
-  return `${hasher.workgroupSize} (${source})`;
+  return `${hasher.kernel.variant}, ${hasher.workgroupSize} threads (${source})`;
 }
 
 function updateBatchHint() {
@@ -428,7 +428,7 @@ async function start() {
   try {
     if (!state.hasher) {
       state.hasher = await GpuHasher.create(await getMiningAdapter(), {
-        onCalibrate: () => setStatus("Calibrating GPU, about 2 s", "working"),
+        onCalibrate: () => setStatus("Calibrating GPU, a few seconds", "working"),
       });
     }
     if (!state.running || session !== state.session) return;
@@ -436,8 +436,8 @@ async function start() {
     el.gpuSupport.textContent = "GPU VERIFIED";
     el.gpuSupport.classList.add("supported");
     log("GPU SHA-1 self-tests passed, including a real pool job.", "good");
-    el.workgroupSize.textContent = workgroupLabel(state.hasher);
-    log(`Workgroup size ${el.workgroupSize.textContent}.`);
+    el.gpuKernel.textContent = kernelLabel(state.hasher);
+    log(`GPU kernel: ${el.gpuKernel.textContent}.`);
     restoreBatchSize(state.hasher);
     state.hasher.device.lost.then(info => {
       state.hasher = null;

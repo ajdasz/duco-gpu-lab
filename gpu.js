@@ -1,4 +1,4 @@
-import { ROW_NONCES, ROW_WORDS, SHADER_VERSION, buildShader, packRow } from "./sha1-shader.js";
+import { ROW_NONCES, ROW_WORDS, SHADER_VARIANTS, SHADER_VERSION, buildShader, packRow } from "./sha1-shader.js";
 
 // Every row reports its own match, so the batch size is limited only by the row buffer.
 // The largest batch leaves room for GPUs many times faster than an RTX 3060 Laptop GPU.
@@ -14,11 +14,12 @@ const NOT_FOUND = 0xffffffff;
 const TIMESTAMP_BYTES = 16;
 // 40 prefix bytes plus 15 decimal nonce digits still fit in one SHA-1 block.
 const MAX_NONCE = 999999999999999;
-const DEFAULT_WORKGROUP_SIZE = 128;
+// A kernel is a shader variant with a workgroup size.
+const DEFAULT_KERNEL = { variant: "table", workgroupSize: 128 };
 const WORKGROUP_SIZES = [64, 128, 256];
 // Calibration warms the GPU up, then times rounds of one batch of about 40 ms per
-// workgroup size. Another size must be at least 3% faster to replace 128.
-const CALIBRATION = { warmUpMs: 400, batchMs: 40, rounds: 8, deadlineMs: 4000, minGain: 1.03 };
+// kernel. Another kernel must be at least 3% faster to replace the default.
+const CALIBRATION = { warmUpMs: 400, batchMs: 40, rounds: 6, deadlineMs: 5000, minGain: 1.03 };
 const CALIBRATION_JOB = ["7a8220fede52c1ccc2ee703cd1b51d36ec7e1ef8", "0".repeat(40)];
 // Calibration batches start at the first 10-digit nonce and stay within 10 digits.
 const CALIBRATION_START = 1000000000;
@@ -45,6 +46,8 @@ export function saveGpuSettings(info, values) {
     localStorage.setItem(settingsKey(info), JSON.stringify({ ...loadGpuSettings(info), ...values }));
   } catch { /* Without storage the GPU is calibrated again next time. */ }
 }
+
+const kernelKey = kernel => `${kernel.variant}:${kernel.workgroupSize}`;
 
 function median(values) {
   const sorted = [...values].sort((a, b) => a - b);
@@ -85,9 +88,9 @@ export function splitRows(start, count) {
 }
 
 export class GpuHasher {
-  constructor(device, { workgroupSize = DEFAULT_WORKGROUP_SIZE } = {}) {
+  constructor(device, { kernel = DEFAULT_KERNEL } = {}) {
     this.device = device;
-    this.workgroupSize = workgroupSize;
+    this.kernel = kernel;
     this.pipelines = new Map();
     this.layout = device.createBindGroupLayout({
       entries: [
@@ -135,52 +138,55 @@ export class GpuHasher {
     this.reset = new Uint32Array(SAMPLE_WORDS + MAX_ROWS).fill(NOT_FOUND, SAMPLE_WORDS);
   }
 
-  // Pass `workgroupSize` to skip calibration; `onCalibrate` is called before a calibration starts.
-  static async create(selectedAdapter = null, { workgroupSize, onCalibrate } = {}) {
+  // Pass `kernel` to skip calibration; `onCalibrate` is called before a calibration starts.
+  static async create(selectedAdapter = null, { kernel, onCalibrate } = {}) {
     if (!navigator.gpu) {
       throw new Error("WebGPU is unavailable. Open this page in a recent Chrome or Chromium on localhost.");
     }
     const adapter = selectedAdapter || await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) throw new Error("No WebGPU adapter was found. Check browser GPU settings and drivers.");
     const info = adapter.info || null;
-    // Without storage the calibration could not be kept, so the default size is used.
+    // Without storage the calibration could not be kept, so the default kernel is used.
     const saved = loadGpuSettings(info);
-    const needsCalibration = !workgroupSize && saved !== null && !saved.workgroupSize;
-    const timing = needsCalibration && adapter.features.has("timestamp-query");
+    const needsCalibration = !kernel && saved !== null && !saved.variant;
+    // Timestamps are only read during calibration, but requesting them every time keeps
+    // the device the same, so the browser can reuse the compiled shaders on later visits.
+    const timing = adapter.features.has("timestamp-query");
     const device = await adapter.requestDevice(timing ? { requiredFeatures: ["timestamp-query"] } : undefined);
-    const sizes = WORKGROUP_SIZES.filter(size => size <= device.limits.maxComputeInvocationsPerWorkgroup &&
-      size <= device.limits.maxComputeWorkgroupSizeX);
-    const savedSize = workgroupSize ? undefined : sizes.find(size => size === saved?.workgroupSize);
-    const hasher = new GpuHasher(device, { workgroupSize: workgroupSize ?? savedSize ?? DEFAULT_WORKGROUP_SIZE });
+    const kernels = SHADER_VARIANTS.flatMap(variant => WORKGROUP_SIZES
+      .filter(size => size <= device.limits.maxComputeInvocationsPerWorkgroup && size <= device.limits.maxComputeWorkgroupSizeX)
+      .map(workgroupSize => ({ variant, workgroupSize })));
+    const savedKernel = kernel ? undefined : kernels.find(candidate => candidate.variant === saved?.variant &&
+      candidate.workgroupSize === saved?.workgroupSize);
+    const hasher = new GpuHasher(device, { kernel: kernel ?? savedKernel ?? DEFAULT_KERNEL });
     hasher.adapterInfo = info;
     hasher.calibration = {
-      source: workgroupSize ? "manual" : savedSize ? "saved" : "default",
-      rate: savedSize && Number.isFinite(saved.rate) ? saved.rate : null,
+      source: kernel ? "manual" : savedKernel ? "saved" : "default",
+      rate: savedKernel && Number.isFinite(saved.rate) ? saved.rate : null,
     };
-    await hasher.prepare();
-    if (needsCalibration && sizes.length > 1) {
+    if (needsCalibration && kernels.length > 1) {
       onCalibrate?.();
-      const fallback = hasher.workgroupSize;
       try {
-        const { workgroupSize: best, rate } = await hasher.calibrate(sizes);
-        if (best !== fallback) {
-          hasher.workgroupSize = best;
-          await hasher.prepare();
-        }
+        // Only the winner gets every nonce length compiled and the full self-tests.
+        const { kernel: best, rate } = await hasher.calibrate(kernels);
+        hasher.kernel = best;
+        await hasher.prepare();
         hasher.calibration = { source: "calibrated", rate };
-        saveGpuSettings(info, { workgroupSize: best, rate });
+        saveGpuSettings(info, { ...best, rate });
       } catch {
-        // Keep the default size, which already passed the self-tests.
-        hasher.workgroupSize = fallback;
+        hasher.kernel = DEFAULT_KERNEL;
       }
       for (const key of hasher.pipelines.keys()) {
-        if (!key.startsWith(`${hasher.workgroupSize}:`)) hasher.pipelines.delete(key);
+        if (!key.startsWith(`${kernelKey(hasher.kernel)}:`)) hasher.pipelines.delete(key);
       }
     }
+    if (hasher.calibration.source !== "calibrated") await hasher.prepare();
     return hasher;
   }
 
-  // Compiles every nonce length for the current workgroup size and runs the self-tests.
+  get workgroupSize() { return this.kernel.workgroupSize; }
+
+  // Compiles every nonce length for the current kernel and runs the self-tests.
   // The pool range always starts at nonce 0.
   async prepare() {
     await Promise.all(Array.from({ length: 15 }, (_, i) => this.pipeline(i + 1)));
@@ -190,21 +196,21 @@ export class GpuHasher {
   // Times batches of 10-digit nonces with two queued, as in mining, so the GPU never
   // idles. Each batch's time comes from GPU timestamps or, without them, from the gap
   // between its result and the previous one. After a warm-up that sizes the batches,
-  // every round runs one batch per workgroup size.
-  // Returns the size with the best median rate, in hashes per second.
-  async calibrate(sizes) {
-    await Promise.all(sizes.map(size => this.pipeline(10, size)));
+  // every round runs one batch per kernel.
+  // Returns the kernel with the best median rate, in hashes per second.
+  async calibrate(kernels) {
+    await Promise.all(kernels.map(kernel => this.pipeline(10, kernel)));
     const started = performance.now();
     const warmUpEnd = started + CALIBRATION.warmUpMs;
-    const order = Array.from({ length: CALIBRATION.rounds }, () => sizes).flat();
-    const samples = new Map(sizes.map(size => [size, []]));
+    const order = Array.from({ length: CALIBRATION.rounds }, () => kernels).flat();
+    const samples = new Map(kernels.map(kernel => [kernel, []]));
     const queue = [];
     let count = 1 << 20;
     let measuring = false;
     const submit = () => {
-      const size = measuring ? order.shift() : this.workgroupSize;
-      const result = this.hashBatch(...CALIBRATION_JOB, CALIBRATION_START, count, { workgroupSize: size, timed: true });
-      queue.push({ size, count, measured: measuring, result });
+      const kernel = measuring ? order.shift() : this.kernel;
+      const result = this.hashBatch(...CALIBRATION_JOB, CALIBRATION_START, count, { kernel, timed: true });
+      queue.push({ kernel, count, measured: measuring, result });
     };
     submit();
     submit();
@@ -217,7 +223,7 @@ export class GpuHasher {
       if (last !== null) {
         const ms = gpuMs ?? now - last;
         if (batch.measured) {
-          samples.get(batch.size).push(batch.count / ms);
+          samples.get(batch.kernel).push(batch.count / ms);
         } else if (!measuring) {
           count = Math.min(Math.max(Math.round(batch.count / ms * CALIBRATION.batchMs), 1 << 16), CALIBRATION_MAX_COUNT);
           measuring = now >= warmUpEnd && Math.abs(ms - CALIBRATION.batchMs) < CALIBRATION.batchMs / 4;
@@ -226,17 +232,18 @@ export class GpuHasher {
       last = now;
       if (!measuring || order.length) submit();
     }
-    const rates = new Map([...samples].map(([size, values]) => [size, median(values)]));
-    let best = this.workgroupSize;
-    for (const [size, rate] of rates) if (rate > rates.get(best)) best = size;
-    if (rates.get(best) < rates.get(this.workgroupSize) * CALIBRATION.minGain) best = this.workgroupSize;
-    return { workgroupSize: best, rate: Math.round(rates.get(best) * 1000), rates };
+    const rates = new Map([...samples].map(([kernel, values]) => [kernel, median(values)]));
+    const fallback = kernels.find(kernel => kernelKey(kernel) === kernelKey(this.kernel));
+    let best = fallback;
+    for (const [kernel, rate] of rates) if (rate > rates.get(best)) best = kernel;
+    if (rates.get(best) < rates.get(fallback) * CALIBRATION.minGain) best = fallback;
+    return { kernel: best, rate: Math.round(rates.get(best) * 1000), rates };
   }
 
-  pipeline(digits, workgroupSize = this.workgroupSize) {
-    const key = `${workgroupSize}:${digits}`;
+  pipeline(digits, kernel = this.kernel) {
+    const key = `${kernelKey(kernel)}:${digits}`;
     if (!this.pipelines.has(key)) {
-      const { code, plan } = buildShader(digits, { workgroupSize });
+      const { code, plan } = buildShader(digits, kernel);
       const promise = (async () => {
         const module = this.device.createShaderModule({ code });
         const errors = (await module.getCompilationInfo()).messages.filter(message => message.type === "error");
@@ -329,17 +336,17 @@ export class GpuHasher {
   // Submits one batch and resolves with its result. Calls may overlap: batches are
   // submitted in call order, so the caller can queue the next batch before awaiting.
   // `timed` adds the GPU time of the batch as `gpuMs` when timestamps are available.
-  hashBatch(prefix, target, start, count, { workgroupSize = this.workgroupSize, timed = false } = {}) {
+  hashBatch(prefix, target, start, count, { kernel = this.kernel, timed = false } = {}) {
     if (!Number.isSafeInteger(start) || start < 0 || start > MAX_NONCE ||
         !Number.isInteger(count) || count < 1 || count > BATCH_SIZE || start + count - 1 > MAX_NONCE) {
       return Promise.reject(new Error("Invalid GPU nonce range."));
     }
-    const submitted = this.queueTail.then(() => this.submitBatch(prefix, target, start, count, workgroupSize, timed));
+    const submitted = this.queueTail.then(() => this.submitBatch(prefix, target, start, count, kernel, timed));
     this.queueTail = submitted.then(() => {}, () => {});
     return submitted.then(pending => pending.result);
   }
 
-  async submitBatch(prefix, target, start, count, workgroupSize, timed) {
+  async submitBatch(prefix, target, start, count, kernel, timed) {
     const slot = this.nextReadback;
     const readback = this.readbacks[slot];
     this.nextReadback = (this.nextReadback + 1) % this.readbacks.length;
@@ -348,7 +355,7 @@ export class GpuHasher {
     const rows = splitRows(start, count);
     const dispatches = [];
     for (const [index, row] of rows.entries()) {
-      const { pipeline, plan } = await this.pipeline(row.digits, workgroupSize);
+      const { pipeline, plan } = await this.pipeline(row.digits, kernel);
       packRow(this.rowData, index * ROW_WORDS, plan, this.rowWords(row.digits, row.high), this.targetWords, { ...row, row: index });
       const invocations = row.vLast - row.vFirst + 1;
       const last = dispatches.at(-1);
@@ -377,7 +384,7 @@ export class GpuHasher {
       });
       pass.setPipeline(dispatch.pipeline);
       pass.setBindGroup(0, this.bindGroup, [dispatch.first * ROW_WORDS * 4]);
-      pass.dispatchWorkgroups(Math.ceil(dispatch.invocations / workgroupSize), dispatch.rows);
+      pass.dispatchWorkgroups(Math.ceil(dispatch.invocations / kernel.workgroupSize), dispatch.rows);
       pass.end();
       if (last) {
         encoder.copyBufferToBuffer(this.output, 0, readback.buffer, TIMESTAMP_BYTES, resultWords * 4);
