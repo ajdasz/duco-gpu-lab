@@ -18,14 +18,11 @@ WebGPU requires a secure context. `localhost` is a secure context; opening `inde
 
 The pool URL is editable under **More settings**. Its default is `https://server.duinocoin.com`, which exposes the same `/legacy_job` API used by the [official Mini Miner](https://server.duinocoin.com/miniminer.html). If Duino-Coin changes that API endpoint, update the field.
 
-## Publish with GitHub Pages
+## GitHub Pages
 
-This repository is ready for GitHub Pages without a build step. The empty `.nojekyll` file tells Pages to serve the static files as they are, including the WebGPU shader.
+The source is in [ajdasz/duco-gpu-lab](https://github.com/ajdasz/duco-gpu-lab). The site URL is [ajdasz.github.io/duco-gpu-lab](https://ajdasz.github.io/duco-gpu-lab/) once GitHub Pages is enabled. No build step is needed. The empty `.nojekyll` file tells Pages to serve the static files as they are, including the WebGPU shader.
 
-1. Create a public GitHub repository, for example `duco-gpu-lab`, and push these files to its `main` branch.
-2. In the repository, open **Settings > Pages**.
-3. Under **Build and deployment**, choose **Deploy from a branch**, then select `main` and `/(root)` and save.
-4. Open `https://YOUR-USERNAME.github.io/duco-gpu-lab/` after Pages finishes publishing.
+If Pages is not enabled yet, open **Settings > Pages** in the repository. Under **Build and deployment**, choose **Deploy from a branch**, then select `main` and `/(root)` and save.
 
 GitHub Pages serves the project over HTTPS, which WebGPU needs outside localhost. Login and mining key values saved on localhost do not transfer to the Pages site because browser storage belongs to each site address. Each visitor enters and stores their own values in their browser. After publishing, verify that the pool accepts job requests and share submissions from the Pages address; the pool controls its cross-origin access policy.
 

@@ -1,0 +1,93 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#101316">
+  <meta name="description" content="DUCO GPU Lab is an experimental WebGPU Duino-Coin miner with live hashrate and pool results.">
+  <title>DUCO GPU Lab</title>
+  <link rel="icon" type="image/svg+xml" href="./favicon.svg">
+  <link rel="stylesheet" href="./style.css">
+  <script type="module" src="./app.js"></script>
+</head>
+<body>
+  <div class="shell">
+    <header class="topbar">
+      <div class="brand"><span class="brand-mark" aria-hidden="true">D</span><span>DUCO <strong>GPU Lab</strong></span></div>
+      <span id="gpuSupport" class="support-pill">Checking GPU</span>
+    </header>
+
+    <aside class="project-notice" role="alert" aria-label="Experimental project notice">
+      <strong>Experimental project</strong>
+      <p>DUCO GPU Lab was built out of curiosity. Mining can increase power use and heat. Use it at your own risk.</p>
+    </aside>
+
+    <main>
+      <section class="intro" aria-labelledby="mainTitle">
+        <div class="intro-copy">
+          <h1 id="mainTitle">DUCO GPU Lab</h1>
+          <p>Follow the work your GPU is doing and see which shares the pool accepts.</p>
+        </div>
+        <div class="intro-controls">
+          <div class="hero-actions">
+            <button id="startButton" class="primary-button" type="button">Start mining</button>
+            <button id="stopButton" class="secondary-button" type="button" disabled>Stop</button>
+          </div>
+          <div class="session-state" role="status" aria-live="polite"><span id="statusDot" class="status-dot"></span><span id="statusText">Ready to mine</span></div>
+        </div>
+      </section>
+
+      <section class="metric-grid" aria-label="Live mining statistics">
+        <article class="metric metric-rate"><span class="metric-label">Hashrate</span><div class="metric-value"><strong id="hashrate">0</strong><span id="rateUnit">H/s</span></div><span class="metric-caption">Current GPU speed</span></article>
+        <article class="metric metric-hashes"><span class="metric-label">Hashes tried</span><div class="metric-value"><strong id="totalHashes" title="0 hashes">0</strong></div><span class="metric-caption">This session</span></article>
+        <article class="metric"><span class="metric-label">Accepted</span><div class="metric-value"><strong id="goodShares">0</strong></div><span class="metric-caption">Confirmed by pool</span></article>
+        <article class="metric"><span class="metric-label">Rejected</span><div class="metric-value"><strong id="badShares">0</strong></div><span class="metric-caption">Declined by pool</span></article>
+      </section>
+
+      <div class="dashboard-grid">
+        <div class="main-column">
+          <section class="panel performance-panel" aria-labelledby="performanceTitle">
+            <div class="panel-heading"><div><p class="section-kicker">PERFORMANCE</p><h2 id="performanceTitle">Hashrate over time</h2></div><span class="chart-chip"><span class="live-dot"></span> Live</span></div>
+            <div class="chart-wrap"><canvas id="rateChart" aria-label="Recent hashrate history"></canvas><div class="chart-empty" id="chartEmpty">Your hashrate will appear here after mining starts.</div></div>
+            <div class="chart-footer"><span>LAST 60 SECONDS</span><span id="peakRate">PEAK 0 H/s</span></div>
+            <div class="job-stats"><div><span>Pool difficulty</span><strong id="difficulty">0</strong></div><div><span>Current nonce</span><strong id="currentNonce">0</strong></div></div>
+          </section>
+
+          <details class="panel calculation-panel">
+            <summary><span><span class="section-kicker">THE CURRENT JOB</span><strong>How a nonce becomes a share</strong></span><span class="summary-action">Show calculation</span></summary>
+            <div class="calculation-content">
+              <p class="calculation-intro">The GPU hashes the previous value with each decimal nonce. A share is submitted when the result matches the target.</p>
+              <div class="formula-flow" aria-label="SHA-1 input and comparison">
+                <div class="formula-box"><span>PREVIOUS HASH + NONCE</span><code id="formulaInput">Waiting for a job</code></div>
+                <div class="formula-box"><span>SHA-1 RESULT</span><code id="sampleHash">No hash yet</code></div>
+              </div>
+              <div class="target-box"><div><span class="target-label">TARGET HASH</span><code id="targetHash">Waiting for a job</code></div><span id="matchBadge" class="match-badge">WAITING</span></div>
+            </div>
+          </details>
+        </div>
+
+        <aside class="side-column">
+          <section class="panel config-panel" aria-labelledby="configTitle">
+            <div class="panel-heading"><div><p class="section-kicker">CONTROLS</p><h2 id="configTitle">Miner settings</h2></div></div>
+            <div class="field"><label for="username">Duino-Coin username</label><input id="username" name="username" autocomplete="username" spellcheck="false" maxlength="32" required></div>
+            <div class="field"><label for="miningKey">Mining key (optional)</label><input id="miningKey" name="miningKey" type="password" autocomplete="off" spellcheck="false" maxlength="128"><small>Only needed if your account uses a mining key.</small></div>
+            <div class="field"><label for="batchSize">GPU batch size</label><div class="batch-control-row"><select id="batchSize" aria-describedby="batchHint"><option value="65536">65,536 hashes, light</option><option value="262144">262,144 hashes, moderate</option><option value="1048576">1,048,576 hashes</option><option value="4194304">4,194,304 hashes</option><option value="8388480">8,388,480 hashes</option><option value="16776960" selected>16,776,960 hashes, conservative</option><option value="33553920">33,553,920 hashes</option><option value="67107840">67,107,840 hashes</option><option value="134215680">134,215,680 hashes</option><option value="268431360">268,431,360 hashes, powerful GPU</option><option value="536862720">536,862,720 hashes, very fast GPU</option></select><label class="auto-batch-toggle"><input id="autoBatch" type="checkbox" aria-describedby="batchHint" checked><span>Auto</span></label></div><small id="batchHint">Auto adjusts the selected size toward 35 to 65 ms per full batch. Stop waits for the current batch.</small></div>
+            <details class="advanced"><summary>More settings</summary><div class="field"><label for="rigName">Rig name</label><input id="rigName" name="rigName" value="WebGPU-Lab" maxlength="32" spellcheck="false"></div><div class="field"><label for="poolUrl">Pool API URL</label><input id="poolUrl" name="poolUrl" value="https://server.duinocoin.com" spellcheck="false"></div></details>
+            <p class="setup-note">Enter a username, then press Start. Username and mining key are saved in this browser.</p>
+          </section>
+
+          <section class="panel session-panel" aria-labelledby="sessionTitle">
+            <div class="panel-heading"><div><p class="section-kicker">SESSION</p><h2 id="sessionTitle">Pool status</h2></div></div>
+            <dl class="session-list"><div><dt>Uptime</dt><dd id="uptime">00:00:00</dd></div><div><dt>Last share</dt><dd id="lastShare">--</dd></div><div><dt>Acceptance</dt><dd id="acceptance">--</dd></div><div><dt>Last match</dt><dd id="lastMatch">None yet</dd></div></dl>
+            <details class="connection-details"><summary>Connection details</summary><dl class="session-list"><div><dt>Node</dt><dd id="nodeName">Not connected</dd></div><div><dt>Pool API</dt><dd id="poolVersion">--</dd></div><div><dt>Pool latency</dt><dd id="latency">-- ms</dd></div><div><dt>Batch time</dt><dd id="batchTime">-- ms</dd></div></dl></details>
+          </section>
+        </aside>
+      </div>
+
+      <section class="panel log-panel" aria-labelledby="logTitle"><div class="panel-heading"><div><p class="section-kicker">ACTIVITY</p><h2 id="logTitle">Recent events</h2></div><button id="clearLog" class="text-button" type="button">Clear log</button></div><ol id="eventLog" class="event-log" aria-live="polite"><li><time>--:--:--</time><span class="log-type info">INFO</span><span>Miner is ready. Press Start to initialize WebGPU.</span></li></ol></section>
+    </main>
+
+    <footer><span>DUCO GPU Lab</span><span>SHA-1(previous hash + decimal nonce)</span><a href="https://duinocoin.com/getting-started.html" target="_blank" rel="noopener noreferrer">Duino-Coin guide</a></footer>
+  </div>
+</body>
+</html>

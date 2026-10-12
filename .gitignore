@@ -1,0 +1,5 @@
+.agents/
+.codex/
+.DS_Store
+__pycache__/
+*.log
