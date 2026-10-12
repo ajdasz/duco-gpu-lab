@@ -90,7 +90,11 @@ export class GpuHasher {
     const adapter = selectedAdapter || await navigator.gpu.requestAdapter({ powerPreference: "high-performance" });
     if (!adapter) throw new Error("No WebGPU adapter was found. Check browser GPU settings and drivers.");
     const device = await adapter.requestDevice();
-    const hasher = new GpuHasher(device, options);
+    const vendor = (device.adapterInfo?.vendor || adapter.info?.vendor || "").toLowerCase();
+    const supports256 = device.limits.maxComputeWorkgroupSizeX >= 256 &&
+      device.limits.maxComputeInvocationsPerWorkgroup >= 256;
+    const workgroupSize = options.workgroupSize ?? (vendor === "nvidia" && supports256 ? 256 : DEFAULT_WORKGROUP_SIZE);
+    const hasher = new GpuHasher(device, { ...options, workgroupSize });
     hasher.adapterInfo = device.adapterInfo || adapter.info || null;
     // Compile every nonce length up front; the pool range always starts at nonce 0.
     await Promise.all(Array.from({ length: 15 }, (_, i) => hasher.pipeline(i + 1)));
