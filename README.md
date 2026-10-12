@@ -34,11 +34,23 @@ The shader performs one SHA-1 block. This covers Duino-Coin's 40-character previ
 
 ## Performance
 
-The batch size starts at a conservative 16,776,960 candidates with **Auto** enabled. After three full batches at one size, Auto uses their median time to step up or down through the available sizes. It aims for 35 to 65 ms per batch, up to 536,862,720 candidates, and ignores shorter batches capped by the end of a pool job. Selecting a batch size manually turns Auto off; the checkbox turns it back on. **Batch time** appears under Connection details. Larger batches reduce submission and readback overhead but may compute more candidates after a match. Select a smaller size if Stop feels delayed or the browser becomes less responsive.
+The batch size starts at a conservative 16,776,960 candidates with **Auto** enabled. After three full batches at one size, Auto uses their median time to step up or down through the available sizes. It aims for 55 to 95 ms per batch, up to 536,862,720 candidates, and ignores shorter batches capped by the end of a pool job. Intermediate 100,661,760 and 201,323,520 candidate sizes give Auto finer steps around its target. Selecting a batch size manually turns Auto off; the checkbox turns it back on. **Batch time** appears under Connection details. Larger batches reduce submission and readback overhead but may compute more candidates after a match. Select a smaller size if Stop feels delayed or the browser becomes less responsive.
 
 The shader packs the fixed 40-character prefix once per job. The CPU precomputes the first ten SHA-1 rounds, which are identical for every nonce in a job. The GPU runs the remaining rounds in separate SHA-1 phases and keeps only 16 schedule words per invocation. The performance chart refreshes once per second and the detailed hash display refreshes at most five times per second. Calculation details are available in the expandable job section.
 
 The displayed hashrate measures candidate hashes computed during the current job. It includes all GPU invocations in a batch, even when a matching nonce is found before the end of that batch. The Hashes tried counter uses K, M, B, T, and Q suffixes; hover it to see the full count. Pool replies, job difficulty, and network time determine how often shares are accepted, so a synthetic GPU benchmark is not a promise of matching payout speed.
+
+### Local batch measurements
+
+One RTX 3060 Laptop GPU in Chrome, with nine timed runs per size after two warmups. The fixed test job had no matching nonce. Each number includes dispatch and result readback, without pool requests.
+
+| Candidates per batch | Nonce starts at 0 | Nonce starts at 100,000,000,000 |
+| ---: | ---: | ---: |
+| 134,215,680 | 37.5 ms, 3.58 GH/s | 44.2 ms, 3.04 GH/s |
+| 201,323,520 | 57.8 ms, 3.48 GH/s | 67.1 ms, 3.00 GH/s |
+| 268,431,360 | 77.4 ms, 3.47 GH/s | 87.8 ms, 3.06 GH/s |
+
+The longer batches gave little extra throughput on this GPU. The new Auto target favors a moderate increase in batch time while keeping Stop responsive. Other GPUs and drivers can produce different results.
 
 The header identifies the WebGPU adapter as precisely as the browser allows. Browsers may hide the exact model, so the page also checks the local WebGL renderer and shows its model when the vendor matches. On systems with multiple GPUs from the same vendor, WebGL may identify a different card; the tooltip says when WebGL supplied the model. If neither API provides a model, the header shows the available vendor and architecture. The GPU name stays in the browser and is not submitted to the pool.
 

@@ -1,5 +1,5 @@
 export class BatchTuner {
-  constructor(sizes, { minimumMs = 35, maximumMs = 65, targetMs = 50 } = {}) {
+  constructor(sizes, { minimumMs = 55, maximumMs = 95, targetMs = 75 } = {}) {
     this.sizes = [...sizes].sort((a, b) => a - b);
     this.minimumMs = minimumMs;
     this.maximumMs = maximumMs;

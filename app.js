@@ -134,7 +134,7 @@ function saveCredentials() {
 
 function updateBatchHint() {
   el.batchHint.textContent = el.autoBatch.checked
-    ? "Auto adjusts the selected size toward 35 to 65 ms per full batch. Stop waits for the current batch."
+    ? "Auto adjusts the selected size toward 55 to 95 ms per full batch. Stop waits for the current batch."
     : "Manual size. Check Batch time under Connection details. Stop waits for the current batch.";
 }
 
