@@ -243,32 +243,44 @@ async function mineJob(job, session) {
   let attempted = 0;
   const started = performance.now();
   let lastDisplay = 0;
-  setStatus("GPU searching nonces", "active");
-  while (nextNonce <= maxNonce && state.running && session === state.session) {
+  let lastFinished = started;
+  // Two batches stay queued so the GPU starts the next one while JavaScript reads the last result.
+  const queued = [];
+  const queueBatch = () => {
     const selectedBatchSize = Number(el.batchSize.value);
     const count = Math.min(selectedBatchSize, maxNonce - nextNonce + 1);
-    const batchStarted = performance.now();
-    const result = await state.hasher.hashBatch(job.previous, job.target, nextNonce, count);
+    const result = state.hasher.hashBatch(job.previous, job.target, nextNonce, count);
+    result.catch(() => {}); // A batch left queued after a match or Stop is ignored.
+    queued.push({ selectedBatchSize, count, result });
+    nextNonce += count;
+  };
+  setStatus("GPU searching nonces", "active");
+  while (state.running && session === state.session) {
+    while (queued.length < 2 && nextNonce <= maxNonce) queueBatch();
+    if (!queued.length) break;
+    const batch = queued.shift();
+    const result = await batch.result;
     if (!state.running || session !== state.session) return null;
-    const batchMs = performance.now() - batchStarted;
+    const finished = performance.now();
+    const batchMs = finished - lastFinished;
+    lastFinished = finished;
     el.batchTime.textContent = `${Math.round(batchMs)} ms`;
-    if (el.autoBatch.checked && Number(el.batchSize.value) === selectedBatchSize && count === selectedBatchSize) {
-      el.batchSize.value = String(batchTuner.observe(selectedBatchSize, batchMs));
+    if (el.autoBatch.checked && Number(el.batchSize.value) === batch.selectedBatchSize && batch.count === batch.selectedBatchSize) {
+      el.batchSize.value = String(batchTuner.observe(batch.selectedBatchSize, batchMs));
     }
     attempted += result.count;
     state.totalHashes += result.count;
-    nextNonce += result.count;
-    const seconds = Math.max((performance.now() - started) / 1000, 0.001);
+    const lastNonce = result.start + result.count - 1;
+    const seconds = Math.max((finished - started) / 1000, 0.001);
     state.rate = attempted / seconds;
     state.peak = Math.max(state.peak, state.rate);
-    const now = performance.now();
-    if (result.found !== null || nextNonce > maxNonce || now - lastDisplay >= 200) {
-      el.currentNonce.textContent = numberFormat.format(nextNonce - 1);
+    if (result.found !== null || lastNonce >= maxNonce || finished - lastDisplay >= 200) {
+      el.currentNonce.textContent = numberFormat.format(lastNonce);
       el.formulaInput.textContent = `${job.previous} + ${result.start}`;
       el.sampleHash.textContent = result.sample;
       el.chartEmpty.hidden = true;
       renderMetrics();
-      lastDisplay = now;
+      lastDisplay = finished;
     }
     if (result.found !== null) {
       if (!await verifyMatch(job.previous, result.found, job.target)) throw new Error("GPU result failed independent SHA-1 verification.");
