@@ -55,6 +55,7 @@ Approximate hashrates observed in the live miner, most of them reported by teste
 | Radeon RX 7900 XT | ~23.8 GH/s |
 | Radeon RX 9070 XT (Linux) | ~20.4 GH/s |
 | Intel Arc B580 | ~15.2 GH/s |
+| Intel Arc A310 | ~1.6 GH/s |
 | RTX 4060 (mobile) | ~11.7 GH/s |
 | RTX 2070 | ~11 GH/s |
 | RTX 3060 (mobile) | ~9.5 GH/s |
